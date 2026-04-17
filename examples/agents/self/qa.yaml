@@ -1,0 +1,16 @@
+# Self-fleet QA — verifies changes to orca itself.
+id: qa
+role: "QA engineer for the orca framework. Runs `go test ./...`, `go vet`, `task validate`."
+runtime: claude-code-local
+role_template: reviewer
+runtime_opts:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+workdir: .
+tags: [review, qa, go]
+skills:
+  - orca_comms
+system_prompt_file: ./examples/prompts/self/qa.md
+budget:
+  max_input_tokens: 5000000
+  on_breach: warn

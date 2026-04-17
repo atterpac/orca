@@ -1,0 +1,15 @@
+id: qa
+role: "QA engineer — verifies diffs and runs tests before the orchestrator closes a task."
+runtime: claude-code-local
+role_template: reviewer
+runtime_opts:
+  model: claude-haiku-4-5-20251001
+  permission_mode: bypassPermissions
+workdir: ./examples/demo-repo
+tags: [review, qa]
+skills:
+  - orca_comms
+system_prompt_file: ./examples/prompts/qa.md
+budget:
+  max_input_tokens: 2000000
+  on_breach: warn

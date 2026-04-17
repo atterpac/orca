@@ -1,0 +1,24 @@
+# Same as architect.yaml but seeded with the demo task. Use this when you want
+# the pipeline to kick off automatically on spawn instead of sending the request
+# manually with `orca send architect "..."`.
+id: architect
+role: "Architecture engineer — plans, reviews, validates QA concerns. Never edits code."
+runtime: claude-code-local
+runtime_opts:
+  model: claude-haiku-4-5-20251001
+  permission_mode: bypassPermissions
+workdir: ./examples/demo-repo
+skills:
+  - orca_comms
+system_prompt_file: ./examples/prompts/architect.md
+budget:
+  max_input_tokens: 2000000
+  on_breach: warn
+initial_prompt: |
+  USER REQUEST:
+  There is a bug in the Greet function in greet/greet.go. When called with an
+  empty string, it returns "Hello, !" which is malformed. The product spec
+  requires that empty names fall back to "Hello, friend!" instead.
+
+  Please plan and execute a fix end to end through the implementer and qa.
+  Add proper test coverage for the empty-name case as part of the work.

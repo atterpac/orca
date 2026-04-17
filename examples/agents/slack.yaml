@@ -1,0 +1,5 @@
+id: slack
+role: "Slack bridge — inbound messages + outbound decisions / updates / announcements."
+runtime: slack
+role_template: persona
+tags: [bridge, slack, comms]

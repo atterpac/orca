@@ -1,0 +1,16 @@
+id: implementer
+role: "Implementation engineer — edits code and runs tests to execute plans."
+runtime: claude-code-local
+role_template: worker
+runtime_opts:
+  model: claude-haiku-4-5-20251001
+  permission_mode: bypassPermissions
+workdir: ./examples/demo-repo
+tags: [code, implementer]
+skills:
+  - orca_comms
+system_prompt_file: ./examples/prompts/implementer.md
+budget:
+  max_input_tokens: 5000000
+  max_cost_usd: 25
+  on_breach: soft_stop

@@ -1,0 +1,572 @@
+# Taskfile — https://taskfile.dev
+#
+# Install once:    brew install go-task
+# List all tasks:  task --list-all
+# Most used:
+#   task dev            — build, start daemon (includes in-process Slack), tail logs
+#   task stop           — kill the daemon
+#   task smoke:decision — fire a test Decision into Slack
+#   task pipeline       — run the three-agent architect/implementer/qa demo
+
+version: '3'
+
+# Load .env at the repo root before any task runs. Every task sees
+# SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_SIGNING_SECRET, etc.
+dotenv: ['.env']
+
+vars:
+  ORCA_BIN: '{{.TASKFILE_DIR}}/bin/orca'
+  LOG_DIR: '/tmp/orca-dev'
+  DAEMON_PID: '{{.LOG_DIR}}/daemon.pid'
+  DAEMON_LOG: '{{.LOG_DIR}}/daemon.log'
+  EVENTS_LOG: '{{.LOG_DIR}}/events.jsonl'
+  DAEMON_ADDR: ':7878'
+  ORCA_ADDR: 'http://localhost:7878'
+
+env:
+  ORCA_ADDR: '{{.ORCA_ADDR}}'
+  ORCA_BIN:  '{{.ORCA_BIN}}'
+
+tasks:
+  # ------------------------------------------------------------------
+  # Default: show help.
+  # ------------------------------------------------------------------
+  default:
+    desc: List available tasks
+    cmds: [task --list-all]
+    silent: true
+
+  # ------------------------------------------------------------------
+  # Build.
+  # ------------------------------------------------------------------
+  build:
+    desc: Build the orca daemon (cmd/orca) — includes in-process Slack runtime
+    sources:
+      - cmd/orca/**/*.go
+      - pkg/**/*.go
+      - internal/**/*.go
+    generates: ['{{.ORCA_BIN}}']
+    cmds:
+      - mkdir -p bin
+      - go build -o {{.ORCA_BIN}} ./cmd/orca
+
+  # ------------------------------------------------------------------
+  # Tests.
+  # ------------------------------------------------------------------
+  test:
+    desc: Run full Go test suite
+    cmds: [go test ./...]
+
+  test:v:
+    desc: Verbose test run (shows every case)
+    cmds: [go test -v ./...]
+
+  test:race:
+    desc: Race detector run
+    cmds: [go test -race ./...]
+
+  # ------------------------------------------------------------------
+  # Run daemon in foreground or background. The daemon boots the slack
+  # runtime in-process when SLACK_BOT_TOKEN is set in .env.
+  # ------------------------------------------------------------------
+  daemon:
+    desc: Run the orca daemon in the foreground
+    deps: [build]
+    cmds:
+      - mkdir -p {{.LOG_DIR}}
+      - '{{.ORCA_BIN}} daemon --addr {{.DAEMON_ADDR}} --events-log {{.EVENTS_LOG}}'
+
+  daemon:bg:
+    desc: Start the orca daemon in the background
+    deps: [build]
+    status:
+      - curl -fsS {{.ORCA_ADDR}}/healthz >/dev/null 2>&1
+    cmds:
+      - mkdir -p {{.LOG_DIR}}
+      - |
+        nohup {{.ORCA_BIN}} daemon --addr {{.DAEMON_ADDR}} --events-log {{.EVENTS_LOG}} \
+          > {{.DAEMON_LOG}} 2>&1 < /dev/null &
+      - task: _wait:healthz
+      - 'echo "daemon up: addr={{.DAEMON_ADDR}} log={{.DAEMON_LOG}}"'
+
+  # ------------------------------------------------------------------
+  # Dev: run daemon, tail logs. Slack is already in-process.
+  # ------------------------------------------------------------------
+  dev:
+    desc: Build + start daemon + tail logs. Ctrl+C tears everything down.
+    deps: [build]
+    cmds:
+      - task: daemon:bg
+      - 'echo ""'
+      - 'echo "  daemon: {{.DAEMON_LOG}}"'
+      - 'echo "  events: {{.EVENTS_LOG}}"'
+      - 'echo ""'
+      - 'echo "  Tailing daemon log. Ctrl+C stops — then run ''task stop''."'
+      - 'echo ""'
+      - defer: { task: stop }
+      - tail -F {{.DAEMON_LOG}}
+
+  # ------------------------------------------------------------------
+  # Agent fleet: architect + implementer + qa + secretary + slack bridge.
+  # ------------------------------------------------------------------
+  fleet:bg:
+    desc: Spawn the demo fleet (works on examples/demo-repo, uses Haiku)
+    deps: [build, daemon:bg]
+    cmds:
+      - |
+        existing=$(curl -fsS {{.ORCA_ADDR}}/agents 2>/dev/null | jq -r '.[].spec.id' | tr '\n' ' ')
+        spawn_if_absent() {
+          local file=$1
+          local id=$(grep -E '^id:' "$file" | head -1 | awk '{print $2}')
+          case " $existing " in
+            *" $id "*) echo "skip: $id already running" ;;
+            *)         {{.ORCA_BIN}} spawn "$file" >/dev/null && echo "spawned: $id" ;;
+          esac
+        }
+        spawn_if_absent examples/agents/slack.yaml
+        spawn_if_absent examples/agents/implementer.yaml
+        spawn_if_absent examples/agents/qa.yaml
+        spawn_if_absent examples/agents/architect.yaml
+        spawn_if_absent examples/agents/secretary.yaml
+
+  self-fleet:bg:
+    desc: Spawn the SELF fleet (works on the orca codebase itself, uses Sonnet)
+    deps: [build, daemon:bg]
+    cmds:
+      - |
+        existing=$(curl -fsS {{.ORCA_ADDR}}/agents 2>/dev/null | jq -r '.[].spec.id' | tr '\n' ' ')
+        spawn_if_absent() {
+          local file=$1
+          local id=$(grep -E '^id:' "$file" | head -1 | awk '{print $2}')
+          case " $existing " in
+            *" $id "*) echo "skip: $id already running" ;;
+            *)         {{.ORCA_BIN}} spawn "$file" >/dev/null && echo "spawned: $id" ;;
+          esac
+        }
+        spawn_if_absent examples/agents/slack.yaml
+        spawn_if_absent examples/agents/self/implementer.yaml
+        spawn_if_absent examples/agents/self/qa.yaml
+        spawn_if_absent examples/agents/self/architect.yaml
+        spawn_if_absent examples/agents/self/secretary.yaml
+
+  fleet:stop:
+    desc: Kill the architect + implementer + qa + secretary + slack agents (works for either fleet)
+    cmds:
+      - |
+        for id in architect implementer qa secretary slack; do
+          curl -sS -X DELETE {{.ORCA_ADDR}}/agents/${id} >/dev/null && echo "killed: $id" || true
+        done
+
+  dev:fleet:
+    desc: Full stack — daemon + DEMO fleet (works on examples/demo-repo, uses Haiku).
+    deps: [build]
+    cmds:
+      - task: daemon:bg
+      - task: fleet:bg
+      - 'echo ""'
+      - 'echo "  demo fleet up (workdir=examples/demo-repo, model=haiku):"'
+      - 'echo "   - slack (bridge)"'
+      - 'echo "   - secretary (intake)"'
+      - 'echo "   - architect (planner/orchestrator)"'
+      - 'echo "   - implementer (code edits)"'
+      - 'echo "   - qa (review)"'
+      - 'echo ""'
+      - 'echo "  Ping the orca bot in #orca-activity or DM it."'
+      - 'echo ""'
+      - 'echo "  daemon: {{.DAEMON_LOG}}"'
+      - 'echo "  events: {{.EVENTS_LOG}}"'
+      - 'echo ""'
+      - 'echo "  Tailing daemon log. Ctrl+C stops — then run ''task stop''."'
+      - 'echo ""'
+      - defer: { task: stop }
+      - tail -F {{.DAEMON_LOG}}
+
+  dev:self-fleet:
+    desc: Full stack with the SELF fleet — agents that work on the orca repo itself (Sonnet).
+    deps: [build]
+    cmds:
+      - task: daemon:bg
+      - task: self-fleet:bg
+      - 'echo ""'
+      - 'echo "  ⚠  SELF FLEET — agents have full access to the orca codebase."'
+      - 'echo "  workdir = . (orca repo root)"'
+      - 'echo "  model   = claude-sonnet-4-6"'
+      - 'echo ""'
+      - 'echo "  Try in slack:"'
+      - 'echo "   - \"explain how auto-correlation works\""'
+      - 'echo "   - \"add a report_warning MCP verb\""'
+      - 'echo ""'
+      - 'echo "  daemon: {{.DAEMON_LOG}}"'
+      - 'echo ""'
+      - defer: { task: stop }
+      - tail -F {{.DAEMON_LOG}}
+
+  # ------------------------------------------------------------------
+  # Tear down.
+  # ------------------------------------------------------------------
+  stop:
+    desc: Stop daemon (SIGTERM — clean shutdown)
+    cmds:
+      - pkill -f "{{.ORCA_BIN}} daemon"       2>/dev/null || true
+      - rm -f {{.DAEMON_PID}} 2>/dev/null || true
+      - echo "orca daemon stopped"
+
+  kill:
+    desc: Aggressive cleanup — SIGKILL every matching process, clear PID files, verify port free
+    cmds:
+      - 'echo "⚠  sending SIGKILL to every orca-related process..."'
+      - |
+        for f in {{.DAEMON_PID}}; do
+          [ -f "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null || true
+          rm -f "$f"
+        done
+      - pkill -9 -f "{{.ORCA_BIN}} daemon" 2>/dev/null || true
+      - pkill -9 -f "bin/orca daemon"      2>/dev/null || true
+      - sleep 1
+      - |
+        # Verify daemon port free.
+        pids=$(lsof -iTCP:7878 -sTCP:LISTEN -P -n -t 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+          echo "⚠  port 7878 still held by pid(s): $pids — force-killing"
+          echo "$pids" | xargs -I{} kill -9 {} 2>/dev/null || true
+          sleep 1
+          if lsof -iTCP:7878 -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+            echo "✗  port 7878 STILL held — manual intervention needed" >&2
+            lsof -iTCP:7878 -sTCP:LISTEN -P -n >&2
+            exit 1
+          fi
+        fi
+        echo "✓  daemon killed; port 7878 free"
+
+  status:
+    desc: Show running processes and daemon health
+    cmds:
+      - |
+        if curl -fsS {{.ORCA_ADDR}}/healthz >/dev/null 2>&1; then
+          echo "daemon:  UP   ({{.ORCA_ADDR}})"
+        else
+          echo "daemon:  DOWN"
+        fi
+      - |
+        # Slack is an in-process virtual agent — check for it via /agents.
+        if curl -fsS {{.ORCA_ADDR}}/agents 2>/dev/null \
+            | jq -e '.[] | select(.spec.id=="slack" and .status=="ready")' >/dev/null 2>&1; then
+          echo "slack:   UP   (in-process virtual agent)"
+        else
+          echo "slack:   DOWN (spawn via 'task fleet:bg' or 'orca spawn examples/agents/slack.yaml')"
+        fi
+      - |
+        echo ""
+        echo "processes:"
+        pgrep -af "orca" | grep -v "task\|Taskfile" || echo "  (none)"
+
+  logs:
+    desc: Tail the daemon log
+    cmds:
+      - tail -F {{.DAEMON_LOG}}
+
+  logs:events:
+    desc: Tail the JSONL event stream (pretty-printed)
+    cmds:
+      - |
+        tail -F {{.EVENTS_LOG}} 2>/dev/null \
+          | jq -rc --unbuffered '"\(.ts[11:19])  \(.agent_id // "-")  \(.kind)  \((.payload // {}) | tostring | .[0:120])"'
+
+  # ------------------------------------------------------------------
+  # Observability — introspect running state.
+  # ------------------------------------------------------------------
+  tasks:
+    desc: List open orca tasks (phase, participants, worktree paths)
+    cmds:
+      - |
+        curl -fsS {{.ORCA_ADDR}}/tasks 2>/dev/null | jq -r '
+          if length == 0 then "(no open tasks)"
+          else
+            ["TASK_ID","PHASE","AGENTS","OPENED_AT"],
+            (.[] | [.id, .phase, (.agents // [] | join(",")), .opened_at])
+            | @tsv
+          end
+        ' | column -t -s $'\t'
+
+  tasks:all:
+    desc: List ALL tasks including closed ones (newest first)
+    cmds:
+      - |
+        curl -fsS '{{.ORCA_ADDR}}/tasks?all=true' 2>/dev/null | jq -r '
+          if length == 0 then "(no tasks)"
+          else
+            ["TASK_ID","PHASE","AGENTS","OPENED_AT","CLOSED_AT"],
+            (.[] | [.id, .phase, (.agents // [] | join(",")), .opened_at, (.closed_at // "-")])
+            | @tsv
+          end
+        ' | column -t -s $'\t'
+
+  task:
+    desc: Show details of a task (usage - task task ID=<task_id>)
+    vars:
+      ID: '{{.ID | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.ID}}" ]; then
+          echo "usage: task task ID=<task_id>" >&2
+          curl -fsS {{.ORCA_ADDR}}/tasks 2>/dev/null | jq -r '.[].id' | sed 's/^/  /' >&2
+          exit 2
+        fi
+        curl -fsS {{.ORCA_ADDR}}/tasks/{{.ID}} | jq .
+      - 'echo ""'
+      - 'echo "=== Artifacts on disk ==="'
+      - |
+        dir=$(curl -fsS {{.ORCA_ADDR}}/tasks/{{.ID}} 2>/dev/null | jq -r '.artifact_dir // empty')
+        if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+          echo "(no artifact dir yet)"
+        else
+          ls -la "$dir"
+          echo ""
+          for f in STATUS.json PLAN.md NOTES.md; do
+            if [ -f "$dir/$f" ]; then
+              echo "--- $f ---"
+              cat "$dir/$f"
+              echo ""
+            fi
+          done
+          if [ -d "$dir/diffs" ]; then
+            echo "--- diffs/ ---"
+            ls "$dir/diffs"
+          fi
+        fi
+
+  tasks:watch:
+    desc: Tail task-related events (opened, closed, handoffs, delivery)
+    cmds:
+      - |
+        tail -F {{.EVENTS_LOG}} 2>/dev/null \
+          | jq -rc --unbuffered '
+            select(.kind | IN("TaskOpened","TaskClosed","MessageSent","MessageDelivered","AgentSpawned","AgentExited"))
+            | "\(.ts[11:19])  \(.agent_id // "-")  \(.kind)  \((.payload // {}) | tostring | .[0:120])"
+          '
+
+  activity:
+    desc: Full snapshot — daemon, agents, tasks, recent events
+    cmds:
+      - 'echo "=== orca activity snapshot ==="'
+      - 'echo ""'
+      - task: status
+      - 'echo ""'
+      - 'echo "=== agents ==="'
+      - |
+        curl -fsS {{.ORCA_ADDR}}/agents 2>/dev/null | jq -r '
+          ["ID","STATUS","RUNTIME","TURNS","COST_USD","TAGS"],
+          (.[] | [
+            .spec.id,
+            .status,
+            .spec.runtime,
+            (.usage.turns // 0 | tostring),
+            (.usage.cost_usd // 0 | tostring),
+            ((.spec.tags // []) | join(","))
+          ]) | @tsv
+        ' | column -t -s $'\t'
+      - 'echo ""'
+      - 'echo "=== open tasks ==="'
+      - |
+        curl -fsS {{.ORCA_ADDR}}/tasks 2>/dev/null | jq -r '
+          if length == 0 then "(none)"
+          else (.[] | "  \(.id)  phase=\(.phase)  agents=\((.agents // []) | join(","))")
+          end
+        '
+      - 'echo ""'
+      - 'echo "=== open decisions ==="'
+      - |
+        curl -fsS {{.ORCA_ADDR}}/decisions 2>/dev/null | jq -r '
+          if length == 0 then "(none)"
+          else (.[] | "  \(.id)  agent=\(.agent_id)  severity=\(.severity)  \(.question | .[0:80])")
+          end
+        '
+      - 'echo ""'
+      - 'echo "=== recent events (last 20 non-TokenChunk) ==="'
+      - |
+        tail -500 {{.EVENTS_LOG}} 2>/dev/null \
+          | jq -rc 'select(.kind != "TokenChunk") | "\(.ts[11:19])  \(.agent_id // "-")  \(.kind)"' \
+          | tail -20
+
+  trace:
+    desc: Chronological event timeline for a task (usage - task trace ID=<task_id>)
+    vars:
+      ID: '{{.ID | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.ID}}" ]; then
+          echo "usage: task trace ID=<task_id>" >&2
+          curl -fsS {{.ORCA_ADDR}}/tasks 2>/dev/null | jq -r '.[].id' | sed 's/^/  /' >&2
+          exit 2
+        fi
+        {{.ORCA_BIN}} trace {{.ID}}
+
+  trace:agent:
+    desc: Recent events for one agent (usage - task trace:agent ID=<agent_id> [LIMIT=200] [KINDS=k1,k2])
+    vars:
+      ID: '{{.ID | default ""}}'
+      LIMIT: '{{.LIMIT | default "200"}}'
+      KINDS: '{{.KINDS | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.ID}}" ]; then
+          echo "usage: task trace:agent ID=<agent_id>" >&2
+          exit 2
+        fi
+        if [ -n "{{.KINDS}}" ]; then
+          {{.ORCA_BIN}} trace --agent {{.ID}} --limit {{.LIMIT}} --kinds {{.KINDS}}
+        else
+          {{.ORCA_BIN}} trace --agent {{.ID}} --limit {{.LIMIT}}
+        fi
+
+  artifacts:
+    desc: Show the on-disk artifact tree for a task (usage - task artifacts ID=<task_id>)
+    vars:
+      ID: '{{.ID | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.ID}}" ]; then
+          echo "usage: task artifacts ID=<task_id>" >&2
+          ls -1 examples/demo-repo/.orca 2>/dev/null | grep -v worktrees | sed 's/^/  /' || echo "  (no tasks yet)"
+          exit 2
+        fi
+        dir=examples/demo-repo/.orca/{{.ID}}
+        if [ ! -d "$dir" ]; then
+          echo "no artifact dir at $dir" >&2
+          exit 1
+        fi
+        find "$dir" -type f | head -50
+        echo ""
+        for f in "$dir"/STATUS.json "$dir"/PLAN.md "$dir"/NOTES.md; do
+          [ -f "$f" ] && { echo "--- $(basename $f) ---"; cat "$f"; echo ""; }
+        done
+
+  # ------------------------------------------------------------------
+  # Smoke tests — drive the system without burning LLM tokens.
+  # ------------------------------------------------------------------
+  smoke:decision:
+    desc: Post a test Decision to Slack via the daemon (verifies the bridge path without running any agent)
+    deps: [daemon:bg]
+    vars:
+      CHANNEL: '{{.CHANNEL | default "#orca-activity"}}'
+    cmds:
+      - |
+        curl -sS -X POST {{.ORCA_ADDR}}/decisions \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "agent_id": "smoke-test",
+            "task_id": "smoke",
+            "question": "Proceed with rolling the database migration?",
+            "options": [
+              "roll forward — adds index, 30s downtime",
+              "defer — keep schema as-is until next window",
+              "split into two PRs"
+            ],
+            "context": [
+              "12k rows affected",
+              "backup snapshot taken 4 min ago",
+              "traffic is at daily low"
+            ],
+            "severity": "high",
+            "timeout_seconds": 1800,
+            "default_option": 2,
+            "channel": "{{.CHANNEL}}",
+            "bridge_agent_id": "slack"
+          }' | jq .
+      - 'echo ""'
+      - 'echo "Decision posted to {{.CHANNEL}} — reply in thread with 1/2/3 or free text."'
+
+  smoke:direct:
+    desc: Send a direct message to the slack virtual agent (tests outbound plain-message path)
+    deps: [daemon:bg]
+    cmds:
+      - |
+        curl -sS -X POST {{.ORCA_ADDR}}/agents/slack/message \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "from": "smoke-test",
+            "kind": "request",
+            "body": "heads up from orca — test direct post"
+          }' | jq .
+
+  smoke:agents:
+    desc: List all agents including the slack bridge
+    cmds: ['curl -sS {{.ORCA_ADDR}}/agents | jq .']
+
+  smoke:decisions:
+    desc: List all open decisions
+    cmds: ['curl -sS {{.ORCA_ADDR}}/decisions | jq .']
+
+  # ------------------------------------------------------------------
+  # Three-agent pipeline demo (architect → implementer → qa).
+  # ------------------------------------------------------------------
+  pipeline:
+    desc: Run the architect/implementer/qa pipeline against examples/demo-repo (uses haiku)
+    deps: [build]
+    cmds:
+      - task: stop
+      - task: daemon:bg
+      - bash examples/observe-pipeline.sh
+
+  # ------------------------------------------------------------------
+  # Repo / state hygiene.
+  # ------------------------------------------------------------------
+  clean:
+    desc: Remove binaries, logs, demo-repo orca state
+    cmds:
+      - rm -rf bin
+      - rm -rf {{.LOG_DIR}}
+      - rm -rf examples/demo-repo/.orca
+
+  # ------------------------------------------------------------------
+  # Lint-like helpers.
+  # ------------------------------------------------------------------
+  vet:
+    desc: go vet ./...
+    cmds: [go vet ./...]
+
+  validate:
+    desc: Validate every example agent yaml (uses live state if daemon is up, schema-only otherwise)
+    deps: [build]
+    cmds:
+      - '{{.ORCA_BIN}} validate examples/agents/*.yaml'
+
+  tidy:
+    desc: go mod tidy
+    cmds: [go mod tidy]
+
+  check-env:
+    desc: Verify required env vars for slack are present (Socket Mode path)
+    cmds:
+      - |
+        missing=""
+        for v in SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+          eval val=\$$v
+          if [ -z "$val" ]; then
+            missing="$missing $v"
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "MISSING:$missing"
+          echo "Put them in .env at the repo root. See .env.example."
+          echo "SLACK_BOT_TOKEN (xoxb-...) is required."
+          echo "SLACK_APP_TOKEN (xapp-...) enables Socket Mode — preferred, no public URL needed."
+          echo "If using HTTP Events API instead, set SLACK_SIGNING_SECRET and drop SLACK_APP_TOKEN."
+          exit 1
+        fi
+        echo "env OK (slack creds present, socket mode)"
+
+  # ------------------------------------------------------------------
+  # Internal helpers (prefixed with _ to hide from normal listings).
+  # ------------------------------------------------------------------
+  _wait:healthz:
+    internal: true
+    cmds:
+      - |
+        for i in $(seq 1 40); do
+          if curl -fsS {{.ORCA_ADDR}}/healthz >/dev/null 2>&1; then exit 0; fi
+          sleep 0.2
+        done
+        echo "daemon did not come up on {{.DAEMON_ADDR}}; logs:" >&2
+        cat {{.DAEMON_LOG}} >&2
+        exit 1

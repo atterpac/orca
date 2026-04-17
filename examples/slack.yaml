@@ -1,0 +1,34 @@
+# Orca-slack sidecar routing config.
+# Point the sidecar at this file with ORCA_SLACK_CONFIG=examples/slack.yaml.
+
+# Every Slack message routed into orca is tagged as a "discussion" by
+# default — it's an open-ended chat, not a formal request. Agents can
+# promote it to a request/handoff/task on their side once scope is clear.
+default_inbound_kind: discussion
+
+# Route inbound Slack messages into orca. Everything goes to the
+# `secretary` — the communicator agent — which classifies and either
+# answers directly or hands engineering tasks to the architect.
+channels:
+  "#orca-activity":
+    route_to_id: secretary
+
+dm_to_bot:
+  route_to_id: secretary
+
+# Messages an agent sends to this bridge (to="slack") without a correlation
+# land in default_channel. With a correlation_id matching a live conversation
+# (decision thread or DM), the sidecar routes to that thread instead.
+outbound:
+  default_channel: "#orca-activity"
+  response_to_channel: true
+
+decisions:
+  # Decisions default to #orca-activity so both conversation + decisions live
+  # in one channel for demo purposes. Flip to a dedicated #orca-decisions once
+  # you have real volume.
+  default_channel: "#orca-activity"
+
+progress:
+  event_kinds: [FINAL, AgentExited, BudgetWarn, BudgetExceeded, TaskClosed]
+  throttle_per_channel: 30s
