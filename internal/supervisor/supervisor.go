@@ -11,15 +11,20 @@ import (
 
 	"github.com/atterpac/orca/internal/bus"
 	"github.com/atterpac/orca/internal/events"
+	"github.com/atterpac/orca/internal/storage"
 	"github.com/atterpac/orca/pkg/orca"
 	"github.com/atterpac/orca/pkg/orca/roletemplates"
 )
 
 type record struct {
-	info     orca.AgentInfo
-	session  orca.Session
-	cancel   context.CancelFunc
-	budget   budgetState
+	info    orca.AgentInfo
+	session orca.Session
+	// ctx is the agent's lifetime context. Passed to per-agent goroutines
+	// (pump, deliverInbox) so a future Session impl that honors ctx can
+	// observe cancellation when Kill/Shutdown fires cancel.
+	ctx    context.Context
+	cancel context.CancelFunc
+	budget budgetState
 }
 
 // budgetState tracks which budget events have already fired for an agent so
@@ -70,6 +75,11 @@ type Supervisor struct {
 
 	// Limits caps dynamic spawning. Zero = unlimited. See SpawnLimits.
 	Limits SpawnLimits
+
+	// store is the optional persistence backend. Nil = in-memory only.
+	// Set once at daemon startup via SetStore; supervisor checks for
+	// nil before every write so no-persistence mode stays zero-cost.
+	store storage.Store
 }
 
 // SpawnLimits caps dynamic-spawn growth so a runaway coordinator cannot
@@ -103,6 +113,58 @@ func (s *Supervisor) RegisterRuntime(rt orca.Runtime) {
 	s.runtimes[rt.Name()] = rt
 }
 
+// SetStore wires a persistence backend. Call once at daemon startup
+// before any Spawn/OpenTask; later changes are not supported. Nil is
+// accepted as "disable persistence" so callers can pass the result of
+// a failed Open unconditionally if they prefer.
+func (s *Supervisor) SetStore(st storage.Store) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = st
+}
+
+// LoadTasksFromStore hydrates the in-memory task registry from the
+// persistence store. Intended to be called once at startup after
+// SetStore. Safe to call with no store (no-op).
+func (s *Supervisor) LoadTasksFromStore(ctx context.Context) error {
+	s.mu.RLock()
+	store := s.store
+	s.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	tasks, err := store.Tasks().ListAll(ctx)
+	if err != nil {
+		return fmt.Errorf("load tasks: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range tasks {
+		cp := t
+		s.tasks[cp.ID] = &cp
+	}
+	return nil
+}
+
+// persistTaskLocked writes t to the store if one is configured. Safe
+// to call with s.mu held (does not re-acquire). Errors are surfaced
+// via the event bus rather than returned — callers are invariably
+// mid-mutation and the in-memory state is authoritative for the
+// current process regardless of whether persistence succeeded.
+func (s *Supervisor) persistTaskLocked(t *orca.Task) {
+	if s.store == nil || t == nil {
+		return
+	}
+	if err := s.store.Tasks().Upsert(context.Background(), *t); err != nil {
+		s.events.Emit(orca.Event{Kind: orca.EvtError, Payload: map[string]any{
+			"scope":   "persistence",
+			"msg":     "failed to persist task",
+			"task_id": t.ID,
+			"err":     err.Error(),
+		}})
+	}
+}
+
 func (s *Supervisor) Runtimes() []orca.RuntimeCaps {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -111,6 +173,27 @@ func (s *Supervisor) Runtimes() []orca.RuntimeCaps {
 		out = append(out, r.Capabilities())
 	}
 	return out
+}
+
+// capabilityGaps returns a list of human-readable mismatches between
+// what the spec asks for and what the runtime can provide. An empty
+// result means the spec is compatible. Each gap is a complete sentence
+// so the caller can join them into a single error message.
+func capabilityGaps(spec orca.AgentSpec, caps orca.RuntimeCaps) []string {
+	var gaps []string
+	if len(spec.Skills) > 0 && caps.SkillFormat == "none" {
+		gaps = append(gaps, fmt.Sprintf("spec declares skills %v but runtime skill_format=none", spec.Skills))
+	}
+	if spec.Isolation == "worktree" && !caps.FileAccess {
+		gaps = append(gaps, "spec requests worktree isolation but runtime has no file access")
+	}
+	if len(spec.ContextFiles) > 0 && !caps.FileAccess {
+		gaps = append(gaps, fmt.Sprintf("spec declares context_files %v but runtime has no file access", spec.ContextFiles))
+	}
+	if spec.SystemPromptFile != "" && !caps.FileAccess {
+		gaps = append(gaps, fmt.Sprintf("spec declares system_prompt_file=%q but runtime has no file access", spec.SystemPromptFile))
+	}
+	return gaps
 }
 
 // RuntimeNames returns the names of all registered runtimes.
@@ -152,6 +235,14 @@ func (s *Supervisor) Spawn(ctx context.Context, spec orca.AgentSpec) (orca.Agent
 	if !ok {
 		s.mu.Unlock()
 		return orca.AgentInfo{}, fmt.Errorf("unknown runtime %s", spec.Runtime)
+	}
+
+	// Capability negotiation: reject specs asking for features the
+	// runtime can't provide. A silent downgrade here would be worse than
+	// failing fast — the spec-writer expected the feature to work.
+	if gaps := capabilityGaps(spec, rt.Capabilities()); len(gaps) > 0 {
+		s.mu.Unlock()
+		return orca.AgentInfo{}, fmt.Errorf("runtime %q lacks capabilities required by spec: %s", spec.Runtime, strings.Join(gaps, "; "))
 	}
 
 	// Parent checks: must exist, must have can_spawn=true, must not exceed depth cap.
@@ -215,14 +306,17 @@ func (s *Supervisor) Spawn(ctx context.Context, spec orca.AgentSpec) (orca.Agent
 			StartedAt: time.Now(),
 		},
 		session: sess,
+		ctx:     sessCtx,
 		cancel:  cancel,
 	}
 	s.mu.Lock()
 	s.agents[spec.ID] = rec
 	s.indexTags(spec.ID, spec.Tags)
+	var taskToPersist *orca.Task
 	if spec.TaskID != "" {
 		if t, ok := s.tasks[spec.TaskID]; ok && !slices.Contains(t.Agents, spec.ID) {
 			t.Agents = append(t.Agents, spec.ID)
+			taskToPersist = t
 		}
 	}
 	s.depth[spec.ID] = spawnDepth
@@ -237,6 +331,7 @@ func (s *Supervisor) Spawn(ctx context.Context, spec orca.AgentSpec) (orca.Agent
 	// Snapshot under lock so concurrent applyEvent writes don't race the
 	// return value. Goroutines start only after the snapshot is taken.
 	snapshot := rec.info
+	s.persistTaskLocked(taskToPersist)
 	s.mu.Unlock()
 
 	go s.pump(rec)
@@ -496,7 +591,7 @@ func tagKey(tags []string) string {
 }
 
 func (s *Supervisor) pump(rec *record) {
-	ch, err := rec.session.Events(context.Background())
+	ch, err := rec.session.Events(rec.ctx)
 	if err != nil {
 		return
 	}
@@ -632,7 +727,11 @@ func budgetPct(b *orca.Budget, u orca.TokenUsage) float64 {
 }
 
 func (s *Supervisor) deliverInbox(rec *record) {
-	ctx, cancel := context.WithCancel(context.Background())
+	// Root the subscription ctx at rec.ctx so Kill/Shutdown (which fire
+	// rec.cancel) unblock the subscription immediately; keep the
+	// session-exit watchdog for the normal-exit path where cancel isn't
+	// called externally.
+	ctx, cancel := context.WithCancel(rec.ctx)
 	defer cancel()
 	go func() {
 		_ = rec.session.Wait()
@@ -665,7 +764,21 @@ func (s *Supervisor) deliverInbox(rec *record) {
 			}})
 			continue
 		}
-		_ = rec.session.Send(ctx, m)
+		if err := rec.session.Send(ctx, m); err != nil {
+			// Surface delivery failures so operators and downstream
+			// observers (TUI, metrics) see messages that never reached
+			// the agent.
+			s.events.Emit(orca.Event{Kind: orca.EvtMessageDropped, AgentID: rec.info.Spec.ID, Payload: map[string]any{
+				"from":   m.From,
+				"to":     rec.info.Spec.ID,
+				"reason": "delivery_error",
+				"kind":   m.Kind,
+				"stage":  "delivery",
+				"msg_id": m.ID,
+				"err":    err.Error(),
+			}})
+			continue
+		}
 		// Record the correlation so the agent's next outbound auto-fills
 		// with it unless overridden. Only non-empty correlations count —
 		// we never "un-correlate" a session.
@@ -765,6 +878,10 @@ func (s *Supervisor) Kill(id string) error {
 	if ok {
 		delete(s.agents, id)
 		s.deindexTags(id, r.info.Spec.Tags)
+		// lastInboundCorr is keyed by agent id; the entry is dead the
+		// moment the agent is gone. Leaving it would leak across every
+		// spawned agent for the daemon's lifetime.
+		s.lastInboundCorr.Delete(id)
 
 		// Collect children that opted into cascade kill before we drop the
 		// parent → children edge, so we can terminate them after unlocking.

@@ -62,7 +62,9 @@ func runValidate(args []string) error {
 			_ = json.Unmarshal(out, &resBody)
 			errs = resBody.Errors
 		} else {
-			errs = orca.ValidateSpec(spec, orca.ValidationContext{})
+			errs = orca.ValidateSpec(spec, orca.ValidationContext{
+				StrictRoleTemplate: os.Getenv("ORCA_REQUIRE_ROLE_TEMPLATE") == "1",
+			})
 		}
 
 		fatal := orca.FatalCount(errs)

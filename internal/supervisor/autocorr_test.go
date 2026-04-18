@@ -101,6 +101,34 @@ func TestAutoCorr_NoSeedLeavesEmpty(t *testing.T) {
 	}
 }
 
+// TestAutoCorr_KillClearsEntry ensures Kill removes the agent's
+// lastInboundCorr record so a long-running daemon with churning agents
+// doesn't accumulate stale entries.
+func TestAutoCorr_KillClearsEntry(t *testing.T) {
+	sup, publish, done := autocorrHarness(t)
+	defer done()
+
+	_, _ = sup.Spawn(context.Background(), orca.AgentSpec{ID: "a", Runtime: "fake"})
+	time.Sleep(30 * time.Millisecond)
+
+	publish(context.Background(), orca.Message{
+		From: "ext", To: "a", CorrelationID: "CONV-DEAD", Kind: orca.KindRequest,
+	})
+	time.Sleep(40 * time.Millisecond)
+
+	if got := sup.AutoCorrelationFor("a"); got != "CONV-DEAD" {
+		t.Fatalf("seed did not stick; got %q", got)
+	}
+
+	if err := sup.Kill("a"); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+
+	if got := sup.AutoCorrelationFor("a"); got != "" {
+		t.Fatalf("lastInboundCorr entry should be cleared after Kill; got %q", got)
+	}
+}
+
 func TestAutoCorr_TaggedDispatchAlsoFills(t *testing.T) {
 	sup, publish, done := autocorrHarness(t)
 	defer done()

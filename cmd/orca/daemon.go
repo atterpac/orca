@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -17,11 +20,115 @@ import (
 	"github.com/atterpac/orca/internal/discussions"
 	"github.com/atterpac/orca/internal/events"
 	"github.com/atterpac/orca/internal/registry"
+	"github.com/atterpac/orca/internal/storage/sqlite"
 	"github.com/atterpac/orca/internal/supervisor"
+	"github.com/atterpac/orca/pkg/orca"
 	"github.com/atterpac/orca/pkg/runtime/bridge"
 	"github.com/atterpac/orca/pkg/runtime/claudecode"
 	slackrt "github.com/atterpac/orca/pkg/runtime/slack"
 )
+
+// defaultStateDBPath returns the platform-appropriate data-dir location
+// for the sqlite state database, following XDG on Linux and the
+// conventional per-OS application data dirs elsewhere. Empty string is
+// returned on error; callers treat that as "persistence disabled".
+func defaultStateDBPath() string {
+	var dir string
+	switch runtime.GOOS {
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, "Library", "Application Support", "orca")
+	case "windows":
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			dir = filepath.Join(v, "orca")
+		} else if v := os.Getenv("APPDATA"); v != "" {
+			dir = filepath.Join(v, "orca")
+		} else {
+			return ""
+		}
+	default:
+		// Linux and BSD: XDG_DATA_HOME with XDG fallback.
+		if v := os.Getenv("XDG_DATA_HOME"); v != "" {
+			dir = filepath.Join(v, "orca")
+		} else {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return ""
+			}
+			dir = filepath.Join(home, ".local", "share", "orca")
+		}
+	}
+	return filepath.Join(dir, "state.db")
+}
+
+// maybeRegisterSlack registers the slack runtime when SLACK_BOT_TOKEN is
+// set. Config or init failure is fatal — a present token is a signal
+// that the operator expects slack and a silent skip would hide broken
+// config. Set ORCA_SLACK_OPTIONAL=1 to downgrade failures to a warning
+// (useful for dev loops where slack credentials come and go).
+func maybeRegisterSlack(sup *supervisor.Supervisor, b bus.Bus, dec *decisions.Registry, logger *slog.Logger) error {
+	if os.Getenv("SLACK_BOT_TOKEN") == "" {
+		return nil
+	}
+	optional := os.Getenv("ORCA_SLACK_OPTIONAL") == "1"
+	cfg, err := slackrt.LoadConfig()
+	if err != nil {
+		if optional {
+			logger.Warn("slack config load failed; skipping", "err", err)
+			return nil
+		}
+		return fmt.Errorf("slack config (set ORCA_SLACK_OPTIONAL=1 to run headless): %w", err)
+	}
+	rt, err := slackrt.New(*cfg, slackrt.Deps{Bus: b, Decisions: dec})
+	if err != nil {
+		if optional {
+			logger.Warn("slack runtime init failed; skipping", "err", err)
+			return nil
+		}
+		return fmt.Errorf("slack runtime init (set ORCA_SLACK_OPTIONAL=1 to run headless): %w", err)
+	}
+	sup.RegisterRuntime(rt)
+	logger.Info("slack runtime registered", "socket_mode", cfg.UseSocketMode())
+	return nil
+}
+
+// writeEventsLog drains the event subscription into w, one JSON line per
+// event. Write errors do not stop the loop; the first failure and every
+// 100th subsequent consecutive failure are logged so a stuck disk
+// doesn't spam stderr. A successful write after any failures emits a
+// recovery log.
+//
+// Uses json.Marshal + Write rather than json.Encoder: Encoder caches its
+// first write error and short-circuits subsequent Encode calls, so a
+// transient disk hiccup would become permanent.
+func writeEventsLog(w io.Writer, ch <-chan orca.Event, logger *slog.Logger) {
+	var consecutiveFails int
+	for e := range ch {
+		b, err := json.Marshal(e)
+		if err != nil {
+			logger.Warn("events log marshal failed", "err", err, "kind", e.Kind)
+			continue
+		}
+		b = append(b, '\n')
+		if _, err := w.Write(b); err != nil {
+			consecutiveFails++
+			if consecutiveFails == 1 || consecutiveFails%100 == 0 {
+				logger.Warn("events log write failed",
+					"err", err,
+					"consecutive_fails", consecutiveFails,
+				)
+			}
+			continue
+		}
+		if consecutiveFails > 0 {
+			logger.Info("events log recovered", "after_fails", consecutiveFails)
+			consecutiveFails = 0
+		}
+	}
+}
 
 func runDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
@@ -29,6 +136,7 @@ func runDaemon(args []string) error {
 	eventsLog := fs.String("events-log", "", "if set, append every event as JSONL to this path")
 	maxAgents := fs.Int("max-agents", 0, "maximum concurrent agents (0 = unlimited)")
 	maxDepth := fs.Int("max-spawn-depth", 0, "maximum dynamic-spawn chain depth (0 = unlimited)")
+	stateDB := fs.String("state-db", defaultStateDBPath(), "sqlite file for persistent task state; empty disables persistence")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -41,6 +149,22 @@ func runDaemon(args []string) error {
 	sup.Limits = supervisor.SpawnLimits{MaxAgents: *maxAgents, MaxDepth: *maxDepth}
 	sup.RegisterRuntime(claudecode.New())
 
+	if *stateDB != "" {
+		if err := os.MkdirAll(filepath.Dir(*stateDB), 0o755); err != nil {
+			return fmt.Errorf("state-db dir: %w", err)
+		}
+		store, err := sqlite.Open(*stateDB)
+		if err != nil {
+			return fmt.Errorf("open state-db: %w", err)
+		}
+		defer store.Close()
+		sup.SetStore(store)
+		if err := sup.LoadTasksFromStore(context.Background()); err != nil {
+			return fmt.Errorf("load state-db: %w", err)
+		}
+		logger.Info("state persistence enabled", "path", *stateDB)
+	}
+
 	bridgeRT := bridge.New(b)
 	sup.RegisterRuntime(bridgeRT)
 
@@ -49,25 +173,8 @@ func runDaemon(args []string) error {
 		return ok
 	})
 
-	// Slack runtime: opt-in. Registers only when SLACK_BOT_TOKEN is present.
-	// Skips silently when unconfigured so the daemon still runs headless.
-	if os.Getenv("SLACK_BOT_TOKEN") != "" {
-		slackCfg, err := slackrt.LoadConfig()
-		if err != nil {
-			logger.Warn("slack runtime skipped", "err", err)
-		} else {
-			slackRT, err := slackrt.New(*slackCfg, slackrt.Deps{
-				Bus:       b,
-				Decisions: decReg,
-			})
-			if err != nil {
-				logger.Warn("slack runtime init failed", "err", err)
-			} else {
-				sup.RegisterRuntime(slackRT)
-				logger.Info("slack runtime registered",
-					"socket_mode", slackCfg.UseSocketMode())
-			}
-		}
+	if err := maybeRegisterSlack(sup, b, decReg, logger); err != nil {
+		return err
 	}
 
 	discReg := discussions.New(ev)
@@ -101,12 +208,7 @@ func runDaemon(args []string) error {
 		ch, _ := ev.Subscribe(ctx, events.Filter{})
 		go func() {
 			defer f.Close()
-			enc := json.NewEncoder(f)
-			for e := range ch {
-				if err := enc.Encode(e); err != nil {
-					return
-				}
-			}
+			writeEventsLog(f, ch, logger)
 		}()
 		logger.Info("events log enabled", "path", *eventsLog)
 	}

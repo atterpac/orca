@@ -96,9 +96,7 @@ func TestMultiSession_RoutesByCorrelation(t *testing.T) {
 }
 
 // TestMultiSession_ConcurrentSendReap exercises the path where the idle
-// sweeper races concurrent Send() callers. Before the ensure() refactor a
-// sweeper that nil'd sub.live between ensure returning and Send dereffing
-// caused a nil-pointer panic under -race. This test must stay clean.
+// sweeper races concurrent Send() callers. Must stay clean under -race.
 func TestMultiSession_ConcurrentSendReap(t *testing.T) {
 	sup, _, done := newMultiHarness(t)
 	defer done()
@@ -141,8 +139,8 @@ func TestMultiSession_ConcurrentSendReap(t *testing.T) {
 		err := ms.Send(ctx, orca.Message{
 			From: "tester", To: "arch", Kind: orca.KindRequest, CorrelationID: corr,
 		})
-		// Send may legitimately fail if the underlying fake closed between
-		// ensure and delivery — we only care that no panic occurs.
+		// Send may legitimately fail when the underlying fake is closed
+		// mid-delivery by the sweeper. Only panics would fail this test.
 		_ = err
 	}
 	close(stop)

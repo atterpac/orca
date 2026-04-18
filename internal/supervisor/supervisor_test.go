@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -97,6 +98,54 @@ func TestInboxDelivery(t *testing.T) {
 			t.Fatal("message never delivered to session")
 		case <-time.After(20 * time.Millisecond):
 		}
+	}
+}
+
+// TestInboxDelivery_SendFailureEmitsDrop confirms a Send error on
+// inbox delivery surfaces as an EvtMessageDropped event tagged
+// reason=delivery_error, so operators can see messages that never
+// reached the agent.
+func TestInboxDelivery_SendFailureEmitsDrop(t *testing.T) {
+	sup, rt, b, ev, done := newHarness(t)
+	defer done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if _, err := sup.Spawn(ctx, orca.AgentSpec{ID: "bob", Runtime: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Subscribe BEFORE triggering the drop so we can't miss the event.
+	subCtx, cancelSub := context.WithCancel(context.Background())
+	defer cancelSub()
+	evCh, _ := ev.Subscribe(subCtx, events.Filter{Kinds: []orca.EventKind{orca.EvtMessageDropped}})
+
+	rt.Session("bob").SetSendErr(errors.New("pipe closed"))
+
+	body, _ := json.Marshal("ping")
+	if err := b.Publish(ctx, orca.Message{From: "cli", To: "bob", Kind: orca.KindRequest, Body: body}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case e := <-evCh:
+		p, ok := e.Payload.(map[string]any)
+		if !ok {
+			t.Fatalf("payload shape unexpected: %T", e.Payload)
+		}
+		if p["reason"] != "delivery_error" {
+			t.Fatalf("want reason=delivery_error, got %v", p["reason"])
+		}
+		if p["err"] != "pipe closed" {
+			t.Fatalf("want err=pipe closed, got %v", p["err"])
+		}
+		if p["from"] != "cli" || p["to"] != "bob" {
+			t.Fatalf("wrong from/to: %v / %v", p["from"], p["to"])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("no MessageDropped event emitted after Send failure")
 	}
 }
 

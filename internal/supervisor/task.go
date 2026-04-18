@@ -137,6 +137,12 @@ func (s *Supervisor) OpenTask(req orca.OpenTaskRequest) (*orca.Task, error) {
 		s.mu.Unlock()
 	}
 
+	// Persist after all in-memory mutations land so the row reflects
+	// the task's final opened-state (including opener in Agents).
+	s.mu.RLock()
+	s.persistTaskLocked(t)
+	s.mu.RUnlock()
+
 	s.events.Emit(orca.Event{Kind: orca.EvtTaskOpened, Payload: map[string]any{
 		"task_id":       t.ID,
 		"repo_root":     t.RepoRoot,
@@ -191,7 +197,15 @@ func (s *Supervisor) announceTaskOpened(req orca.OpenTaskRequest, t *orca.Task) 
 		CorrelationID: t.ID,
 		Timestamp:     time.Now(),
 	}
-	_ = s.bus.Publish(context.Background(), msg)
+	if err := s.bus.Publish(context.Background(), msg); err != nil {
+		s.events.Emit(orca.Event{Kind: orca.EvtError, Payload: map[string]any{
+			"scope":   "task",
+			"msg":     "failed to announce task_opened to bridge",
+			"task_id": t.ID,
+			"bridge":  bridge,
+			"err":     err.Error(),
+		}})
+	}
 }
 
 // CloseTask marks the task closed. When removeWorktree is true the git
@@ -215,6 +229,7 @@ func (s *Supervisor) CloseTask(id string, removeWorktree bool) (*orca.Task, erro
 	now := time.Now()
 	t.ClosedAt = &now
 	t.Phase = "closed"
+	s.persistTaskLocked(t)
 	s.mu.Unlock()
 
 	if removeWorktree && t.WorktreePath != "" {

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,53 @@ func TestSpawn_CascadeKill(t *testing.T) {
 			t.Fatalf("cascade failed: cling_alive=%v orphan_alive=%v", clingAlive, orphanAlive)
 		case <-time.After(20 * time.Millisecond):
 		}
+	}
+}
+
+// TestSpawn_CapabilityNegotiation rejects specs that ask for features
+// the runtime can't provide (Skills, ContextFiles, SystemPromptFile,
+// Isolation=worktree on a runtime without FileAccess or skill support).
+// The fake runtime has SkillFormat=none and no file access, so all four
+// surface as spawn errors.
+func TestSpawn_CapabilityNegotiation(t *testing.T) {
+	cases := []struct {
+		name string
+		spec orca.AgentSpec
+		want string
+	}{
+		{
+			name: "skills on non-skill runtime",
+			spec: orca.AgentSpec{ID: "a", Runtime: "fake", Skills: []string{"orca_comms"}},
+			want: "skill_format=none",
+		},
+		{
+			name: "worktree without file access",
+			spec: orca.AgentSpec{ID: "b", Runtime: "fake", Isolation: "worktree"},
+			want: "worktree isolation",
+		},
+		{
+			name: "context_files without file access",
+			spec: orca.AgentSpec{ID: "c", Runtime: "fake", ContextFiles: []string{"/tmp/x"}},
+			want: "context_files",
+		},
+		{
+			name: "system_prompt_file without file access",
+			spec: orca.AgentSpec{ID: "d", Runtime: "fake", SystemPromptFile: "/tmp/p.md"},
+			want: "system_prompt_file",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sup, _, _, _, done := budgetHarness(t)
+			defer done()
+			_, err := sup.Spawn(context.Background(), c.spec)
+			if err == nil {
+				t.Fatalf("expected capability rejection, got nil")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error should mention %q, got %v", c.want, err)
+			}
+		})
 	}
 }
 

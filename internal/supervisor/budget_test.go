@@ -13,6 +13,34 @@ import (
 	"github.com/atterpac/orca/pkg/orca"
 )
 
+// waitForEventKind polls snap until at least one event of the given
+// kind has landed or the deadline expires. Centralizes the
+// Emit-vs-collector async gap so tests don't need hand-tuned sleeps —
+// events.Bus.Emit pushes to a buffered channel synchronously, but the
+// collector goroutine reads asynchronously and may not have appended
+// to its slice by the time the test checks.
+func waitForEventKind(t *testing.T, snap func() []orca.Event, kind orca.EventKind, timeout time.Duration) []orca.Event {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		var matches []orca.Event
+		for _, e := range snap() {
+			if e.Kind == kind {
+				matches = append(matches, e)
+			}
+		}
+		if len(matches) > 0 {
+			return matches
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for %s event; got %v", kind, snap())
+			return nil
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // collectEvents subscribes and returns a func that snapshots the events
 // observed so far. Filters by kind so we ignore the usual lifecycle churn.
 func collectEvents(t *testing.T, ev *events.Bus, kinds ...orca.EventKind) (func() []orca.Event, func()) {
@@ -116,15 +144,10 @@ func TestBudget_ExceededWarnPolicy(t *testing.T) {
 	})
 	time.Sleep(30 * time.Millisecond)
 	rt.Session("a").AddUsage(orca.TokenUsage{CostUSD: 1.5})
-	time.Sleep(50 * time.Millisecond)
 
-	got := snap()
-	kinds := map[orca.EventKind]int{}
-	for _, e := range got {
-		kinds[e.Kind]++
-	}
-	if kinds[orca.EvtBudgetExceeded] != 1 {
-		t.Fatalf("want 1 BudgetExceeded, got %v", got)
+	exceeded := waitForEventKind(t, snap, orca.EvtBudgetExceeded, time.Second)
+	if len(exceeded) != 1 {
+		t.Fatalf("want 1 BudgetExceeded, got %d: %v", len(exceeded), exceeded)
 	}
 	// Warn-only policy must not pause the agent.
 	cur, _ := sup.Get(info.Spec.ID)
@@ -191,21 +214,23 @@ func TestBudget_HardInterruptKillsAgent(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	rt.Session("a").AddUsage(orca.TokenUsage{InputTokens: 100})
-	// Give supervisor time to emit event + schedule kill + remove from registry.
-	deadline := time.After(500 * time.Millisecond)
+
+	got := waitForEventKind(t, snap, orca.EvtBudgetExceeded, time.Second)
+	if len(got) != 1 {
+		t.Fatalf("want exactly one BudgetExceeded, got %d: %v", len(got), got)
+	}
+
+	// Now wait for the agent to actually be removed from the registry.
+	deadline := time.After(time.Second)
 	for {
-		if list := sup.List(); len(list) == 0 {
-			break
+		if len(sup.List()) == 0 {
+			return
 		}
 		select {
 		case <-deadline:
 			t.Fatalf("agent not removed after hard_interrupt; list=%v", sup.List())
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 		}
-	}
-
-	if got := snap(); len(got) != 1 || got[0].Kind != orca.EvtBudgetExceeded {
-		t.Fatalf("want one BudgetExceeded, got %v", got)
 	}
 }
 
@@ -228,14 +253,6 @@ func TestBudget_PctAcrossMultipleDimensions(t *testing.T) {
 	})
 	time.Sleep(30 * time.Millisecond)
 	rt.Session("a").AddUsage(orca.TokenUsage{InputTokens: 100, OutputTokens: 50, CostUSD: 0.15})
-	time.Sleep(50 * time.Millisecond)
 
-	got := snap()
-	seen := map[orca.EventKind]bool{}
-	for _, e := range got {
-		seen[e.Kind] = true
-	}
-	if !seen[orca.EvtBudgetExceeded] {
-		t.Fatalf("expected BudgetExceeded triggered by cost dim, got %v", got)
-	}
+	waitForEventKind(t, snap, orca.EvtBudgetExceeded, time.Second)
 }

@@ -156,11 +156,12 @@ func (m *multiSession) Close() error {
 
 // internals
 
-// ensure returns a live session for the given correlation, spawning one if
-// needed. The returned Session reference is captured under m.mu so callers
-// never read sub.live without holding the lock. A concurrent sweeper may
-// Close the underlying process after ensure returns; that surfaces as an
-// error from live.Send rather than a nil-pointer deref.
+// ensure returns a live session for the given correlation, spawning one
+// if needed. The returned Session reference is captured under m.mu so
+// callers never read sub.live without holding the lock. A concurrent
+// sweeper may Close the underlying process while a caller still holds
+// the reference; that surfaces as an error from live.Send, not a
+// nil-pointer deref.
 func (m *multiSession) ensure(corr string) (orca.Session, error) {
 	key := corrKey(corr)
 	m.mu.Lock()
@@ -235,10 +236,11 @@ func (m *multiSession) ensure(corr string) (orca.Session, error) {
 }
 
 // pumpSub forwards a sub-session's events to the aggregated channel,
-// filtering out per-sub lifecycle events so the supervisor sees one logical
-// agent. On sub exit, usage is harvested and live is cleared so the next
-// ensure() spawns a fresh process (resuming via sessionID when present).
-// live is passed explicitly so we don't race sweeper writes to sub.live.
+// filtering out per-sub lifecycle events so the supervisor sees one
+// logical agent. On sub exit, usage is harvested and live is cleared so
+// the next ensure() spawns a fresh process (resuming via sessionID when
+// present). live is passed by value so this goroutine never races the
+// sweeper on sub.live.
 func (m *multiSession) pumpSub(sub *subSession, live orca.Session) {
 	ch, err := live.Events(context.Background())
 	if err != nil {
@@ -265,8 +267,8 @@ func (m *multiSession) pumpSub(sub *subSession, live orca.Session) {
 		}
 	}
 	m.mu.Lock()
-	// Sweeper or Close may have already cleared sub.live and harvested
-	// usage. Only harvest + clear if our live is still the one installed.
+	// Only harvest + clear if our live is still the one installed — the
+	// sweeper or Close may have already cleared it and harvested usage.
 	if sub.live == live {
 		m.usageSumFixed = m.usageSumFixed.Add(live.Usage())
 		sub.live = nil

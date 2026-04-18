@@ -132,6 +132,29 @@ func TestList_NewestFirst(t *testing.T) {
 	}
 }
 
+// TestEffectiveSweepInterval covers the clamp that bounds sweep latency
+// at 25% of InactivityTimeout, plus the floor that prevents a busy loop.
+func TestEffectiveSweepInterval(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Limits
+		want time.Duration
+	}{
+		{"zero defaults to 1m", Limits{}, time.Minute},
+		{"capped to timeout/4", Limits{InactivityTimeout: 4 * time.Minute, SweepInterval: 10 * time.Minute}, time.Minute},
+		{"honored when under cap", Limits{InactivityTimeout: 1 * time.Hour, SweepInterval: 30 * time.Second}, 30 * time.Second},
+		{"1s floor", Limits{InactivityTimeout: 100 * time.Millisecond, SweepInterval: 10 * time.Millisecond}, time.Second},
+		{"no timeout skips cap", Limits{InactivityTimeout: 0, SweepInterval: 5 * time.Hour}, 5 * time.Hour},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := effectiveSweepInterval(c.in); got != c.want {
+				t.Fatalf("want %v, got %v", c.want, got)
+			}
+		})
+	}
+}
+
 func TestStop_Idempotent(t *testing.T) {
 	r := New(&capEvents{})
 	r.Stop()

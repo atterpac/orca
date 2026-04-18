@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -138,6 +139,7 @@ func (s *Server) validateAgentSpec(w http.ResponseWriter, r *http.Request) {
 			_, ok := s.sup.GetTask(id)
 			return ok
 		},
+		StrictRoleTemplate: os.Getenv("ORCA_REQUIRE_ROLE_TEMPLATE") == "1",
 	}
 	errs := orca.ValidateSpec(spec, ctx)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -519,7 +521,6 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request, f events.F
 	defer cancel()
 	ch, _ := s.events.Subscribe(ctx, f)
 
-	enc := json.NewEncoder(w)
 	ping := time.NewTicker(15 * time.Second)
 	defer ping.Stop()
 
@@ -528,16 +529,31 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request, f events.F
 		case <-ctx.Done():
 			return
 		case <-ping.C:
-			_, _ = w.Write([]byte(": ping\n\n"))
+			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+				return
+			}
 			flusher.Flush()
 		case ev, ok := <-ch:
 			if !ok {
 				return
 			}
-			_, _ = w.Write([]byte("event: " + string(ev.Kind) + "\n"))
-			_, _ = w.Write([]byte("data: "))
-			_ = enc.Encode(ev)
-			_, _ = w.Write([]byte("\n"))
+			data, err := json.Marshal(ev)
+			if err != nil {
+				// Malformed event payload. Skip it rather than killing
+				// the stream — other events will still flow.
+				continue
+			}
+			// Build the SSE frame in one slice so a write failure is
+			// detected once and aborts the whole frame atomically.
+			frame := make([]byte, 0, len(data)+32+len(ev.Kind))
+			frame = append(frame, "event: "...)
+			frame = append(frame, ev.Kind...)
+			frame = append(frame, "\ndata: "...)
+			frame = append(frame, data...)
+			frame = append(frame, "\n\n"...)
+			if _, err := w.Write(frame); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}

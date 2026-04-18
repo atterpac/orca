@@ -30,13 +30,20 @@ type EventSink interface {
 }
 
 // Limits bounds the registry. Zero values are ignored.
+//
+// Expiry latency: a discussion crossing its InactivityTimeout is
+// detected within one SweepInterval. SweepInterval is automatically
+// clamped to at most InactivityTimeout/4 inside the sweep loop, so the
+// worst-case latency is ~25% of the timeout even if both fields are
+// configured independently. A 1-second floor prevents a busy loop when
+// InactivityTimeout is set very low.
 type Limits struct {
 	// InactivityTimeout is how long a discussion may remain open without
 	// any message before it's auto-closed with status=expired. Default
 	// 30 minutes. Set <=0 to disable the sweeper.
 	InactivityTimeout time.Duration
-	// SweepInterval is how often the background sweeper runs.
-	// Default 1 minute.
+	// SweepInterval is the desired tick between sweeps. Default 1 minute.
+	// Clamped to InactivityTimeout/4 at runtime so staleness stays bounded.
 	SweepInterval time.Duration
 }
 
@@ -199,10 +206,7 @@ func (r *Registry) Stop() {
 
 func (r *Registry) sweepLoop() {
 	defer r.wg.Done()
-	interval := r.Limits.SweepInterval
-	if interval <= 0 {
-		interval = 1 * time.Minute
-	}
+	interval := effectiveSweepInterval(r.Limits)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -213,6 +217,26 @@ func (r *Registry) sweepLoop() {
 			r.sweepOnce()
 		}
 	}
+}
+
+// effectiveSweepInterval normalizes the configured sweep interval so a
+// misconfigured pair (e.g. timeout=1m, sweep=1m) can't leave
+// discussions stale for nearly a full timeout. The result is bounded
+// above by InactivityTimeout/4 and below by 1s.
+func effectiveSweepInterval(l Limits) time.Duration {
+	interval := l.SweepInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	if l.InactivityTimeout > 0 {
+		if cap := l.InactivityTimeout / 4; interval > cap {
+			interval = cap
+		}
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
 }
 
 func (r *Registry) sweepOnce() {

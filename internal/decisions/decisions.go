@@ -354,14 +354,22 @@ func (r *Registry) onTimeout(id string) {
 		notice = "⏰ decision `" + id + "` timed out — applied default option " + itoa(defaultOpt) + "."
 	}
 	body, _ := json.Marshal(notice)
-	_ = r.publisher.Publish(context.Background(), orca.Message{
+	if err := r.publisher.Publish(context.Background(), orca.Message{
 		From:          "orca",
 		To:            bridge,
 		Kind:          orca.KindEvent,
 		Body:          body,
 		CorrelationID: id,
 		Timestamp:     time.Now(),
-	})
+	}); err != nil {
+		r.events.Emit(orca.Event{Kind: orca.EvtError, Payload: map[string]any{
+			"scope":       "decisions",
+			"msg":         "failed to publish timeout notice to bridge",
+			"decision_id": id,
+			"bridge":      bridge,
+			"err":         err.Error(),
+		}})
+	}
 
 	r.events.Emit(orca.Event{Kind: "DecisionTimedOut", Payload: map[string]any{
 		"decision_id":     id,

@@ -77,6 +77,7 @@ func (r *FakeRuntime) Start(ctx context.Context, spec orca.AgentSpec) (orca.Sess
 		events: make(chan orca.Event, 64),
 		inbox:  make(chan orca.Message, 64),
 		done:   make(chan struct{}),
+		stop:   make(chan struct{}),
 		script: script,
 	}
 	r.sessions[spec.ID] = s
@@ -91,16 +92,32 @@ type FakeSession struct {
 	spec   orca.AgentSpec
 	events chan orca.Event
 	inbox  chan orca.Message
-	done   chan struct{}
-	script *Script
+	// done is closed by finish() once, guarded by closed.Swap.
+	// stop is closed by Close() via stopOnce to signal run() to bail;
+	// keeping the two channels separate avoids a double-close race
+	// between Close() and finish() both trying to own s.done.
+	done     chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
+	script   *Script
 
 	mu      sync.RWMutex
 	usage   orca.TokenUsage
 	closed  atomic.Bool
 	waitErr error
 
-	sendMu sync.Mutex
-	sent   []orca.Message // captures every Send for assertions; read via Sent()
+	sendMu  sync.Mutex
+	sent    []orca.Message // captures every Send for assertions; read via Sent()
+	sendErr error          // when non-nil, Send returns this instead of succeeding
+}
+
+// SetSendErr configures Send to return the given error instead of
+// accepting the message. Used by supervisor tests to simulate a dead
+// session during inbox delivery.
+func (s *FakeSession) SetSendErr(err error) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	s.sendErr = err
 }
 
 // Sent returns a snapshot of all messages received via Send. Safe to call
@@ -123,8 +140,14 @@ func (s *FakeSession) Usage() orca.TokenUsage {
 
 func (s *FakeSession) Send(ctx context.Context, m orca.Message) error {
 	s.sendMu.Lock()
-	s.sent = append(s.sent, m)
+	sendErr := s.sendErr
+	if sendErr == nil {
+		s.sent = append(s.sent, m)
+	}
 	s.sendMu.Unlock()
+	if sendErr != nil {
+		return sendErr
+	}
 	for _, step := range s.script.Steps {
 		if step.OnSend != nil {
 			step.OnSend(m, s)
@@ -152,13 +175,10 @@ func (s *FakeSession) Wait() error {
 }
 
 func (s *FakeSession) Close() error {
-	// Signal run() to exit; it will invoke finish() which handles the close
-	// sequence atomically (guarded by s.closed).
-	select {
-	case <-s.done:
-	default:
-		close(s.done)
-	}
+	// Signal run() to exit. finish() is the sole owner of s.done and
+	// s.events close; using a separate stop channel prevents Close()
+	// and finish() from racing to close s.done.
+	s.stopOnce.Do(func() { close(s.stop) })
 	return nil
 }
 
@@ -206,7 +226,8 @@ func (s *FakeSession) run(ctx context.Context) {
 			case <-ctx.Done():
 				s.finish()
 				return
-			case <-s.done:
+			case <-s.stop:
+				s.finish()
 				return
 			}
 		}
@@ -223,7 +244,7 @@ func (s *FakeSession) run(ctx context.Context) {
 	// last event and only exit on explicit termination.
 	select {
 	case <-ctx.Done():
-	case <-s.done:
+	case <-s.stop:
 	}
 	s.finish()
 }
@@ -244,9 +265,5 @@ func (s *FakeSession) finish() {
 	default:
 	}
 	close(s.events)
-	select {
-	case <-s.done:
-	default:
-		close(s.done)
-	}
+	close(s.done)
 }
